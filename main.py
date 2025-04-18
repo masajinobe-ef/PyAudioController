@@ -1,168 +1,180 @@
 import json
 import time
-import pyaudio
-import aubio
 import numpy as np
-from pynput import mouse
+import sounddevice as sd
 from pynput.keyboard import Controller as KeyController
-from pynput.mouse import Controller as MouseController
+from pynput.mouse import Controller as MouseController, Button
+from collections import deque
 
-class OptimizedAudioController:
-    def __init__(self, config_path='config.json'):
+class GuitarHeroController:
+    def __init__(self, config_path="config.json"):
         self.load_config(config_path)
-        self.setup_audio()
+        self.device_index = self.select_input_device()
+        self.setup_audio_processing()
         self.setup_controllers()
-        self.last_processed_time = 0
-        self.activation_history = {}
+        self.window = np.blackman(self.chunk_size)
+        self.freq_history = deque(maxlen=10)
+        self.note_display = {
+            82.41: ("E2", "W [↑]", "↑"),
+            110.0: ("A2", "S [↓]", "↓"),
+            146.83: ("D3", "A [←]", "←"),
+            196.0: ("G3", "D [→]", "→"),
+            246.94: ("B3", "LMB [⚔]", "⚔"),
+            329.63: ("E4", "RMB [🛡]", "🛡")
+        }
+        self.active_actions = set()
+        self.spectrum = []
+        self.last_print = time.time()
 
     def load_config(self, path):
-        with open(path, 'r') as f:
+        with open(path, "r") as f:
             self.config = json.load(f)
+        self.note_map = {params["freq"]: params for params in self.config["note_bindings"].values()}
+        self.detection_thresh = self.config["audio_settings"]["detection_threshold"]
+        print("🎸 Гитарный контроллер инициализирован!")
 
-        self.note_map = {}
-        for note, params in self.config['note_bindings'].items():
-            self.note_map[params['freq']] = {
-                "type": params['type'],
-                "action": params['action']
-            }
+    def select_input_device(self):
+        devices = sd.query_devices()
+        input_devices = [i for i, dev in enumerate(devices) if dev["max_input_channels"] > 0]
+        if not input_devices:
+            raise RuntimeError("🔇 Устройства ввода не найдены")
+        print("\n🎤 Доступные аудиоустройства:")
+        for i in input_devices:
+            print(f"  [{i}] {devices[i]['name']}")
+        while True:
+            try:
+                choice = int(input("🎚 Выберите номер устройства: "))
+                if choice in input_devices:
+                    return choice
+                print("❌ Неверный выбор")
+            except ValueError:
+                print("⚠️ Введите число")
 
-    def setup_audio(self):
-        self.p = pyaudio.PyAudio()
-        self.set_pitch_algorithm()
-
-        self.stream = self.p.open(
-            format=pyaudio.paFloat32,
+    def setup_audio_processing(self):
+        audio_cfg = self.config["audio_settings"]
+        device_info = sd.query_devices(self.device_index)
+        self.sample_rate = int(audio_cfg.get("sample_rate", device_info["default_samplerate"]))
+        self.chunk_size = audio_cfg["chunk_size"]
+        self.silence_thresh = audio_cfg["silence_threshold"]
+        self.stream = sd.InputStream(
+            device=self.device_index,
             channels=1,
-            rate=self.config['audio_settings']['sample_rate'],
-            input=True,
-            input_device_index=self.get_input_device_index(),
-            frames_per_buffer=self.config['audio_settings']['chunk_size'],
-            start=False,
-            stream_callback=self.audio_callback
+            samplerate=self.sample_rate,
+            blocksize=self.chunk_size,
+            callback=self.process_audio,
+            dtype="float32"
         )
-
-    def set_pitch_algorithm(self):
-        algorithm = self.config['audio_settings'].get('pitch_algorithm', 'yin')
-        self.pitch_detector = aubio.pitch(
-            algorithm,
-            self.config['audio_settings']['chunk_size'],
-            self.config['audio_settings']['chunk_size'],
-            self.config['audio_settings']['sample_rate']
-        )
-        self.pitch_detector.set_silence(self.config['audio_settings']['silence_threshold'])
-        self.pitch_detector.set_tolerance(0.7)
-
-        if algorithm == 'yinfft':
-            self.pitch_detector.set_tolerance(0.85)
-
-    def get_input_device_index(self):
-        try:
-            default_dev = self.p.get_default_input_device_info()
-            return default_dev['index']
-        except Exception:
-            for i in range(self.p.get_device_count()):
-                dev = self.p.get_device_info_by_index(i)
-                if dev['maxInputChannels'] > 0:
-                    return i
-        return None
+        print(f"🔊 Аудиопоток настроен на {self.sample_rate/1000}kHz")
 
     def setup_controllers(self):
         self.keyboard = KeyController()
         self.mouse = MouseController()
-        self.key_states = {}
-        self.mouse_states = {'left': False, 'right': False}
-        self.cpu_profile = self.config['audio_settings'].get('cpu_usage', 'medium')
+        print("🎮 Контроллеры подключены")
 
-    def optimize_cpu_usage(self):
-        if self.cpu_profile == 'low':
-            aubio.filter.set_resampler_quality(self.config['audio_settings'].get('resample_quality', 3))
-        elif self.cpu_profile == 'high':
-            aubio.filter.set_resampler_quality(self.config['audio_settings'].get('resample_quality', 5))
+    def process_audio(self, indata, frames, time_info, status):
+        audio_data = indata[:, 0] * np.iinfo(np.int16).max
+        audio_data = audio_data.astype(np.float32)
+        windowed = audio_data * self.window
+        fft = np.fft.rfft(windowed)
+        magnitudes = np.abs(fft) ** 2
+        min_freq = 50
+        min_bin = int(min_freq * self.chunk_size / self.sample_rate)
+        min_bin = max(1, min_bin)
+        spectrum_segment = magnitudes[min_bin:int(len(magnitudes)*0.8)]
+        peak_bin = np.argmax(spectrum_segment) + min_bin
+        peak_power = magnitudes[peak_bin]
+        if peak_power < self.detection_thresh:
+            self.release_actions()
+            return
+        freq = peak_bin * self.sample_rate / self.chunk_size
+        self.freq_history.append(freq)
+        if 1 < peak_bin < len(magnitudes)-1:
+            y0, y1, y2 = np.log(magnitudes[peak_bin-1:peak_bin+2])
+            delta = (y0 - y2) / (2*(y0 - 2*y1 + y2))
+            refined_freq = (peak_bin + delta) * self.sample_rate / self.chunk_size
+            freq = refined_freq
+        detected_note = self.find_closest_note(freq)
+        self.spectrum = magnitudes
+        if time.time() - self.last_print > 0.1:
+            self.visualize_spectrum()
+            self.last_print = time.time()
+        if detected_note:
+            self.trigger_action(detected_note)
+            self.display_note(detected_note)
+        else:
+            self.release_actions()
 
     def find_closest_note(self, freq):
-        try:
-            return min(self.note_map.keys(), key=lambda x: abs(float(x) - freq))
-        except Exception:
+        frequencies = np.array(list(self.note_map.keys()))
+        if frequencies.size == 0 or freq < 50 or freq > 1000:
             return None
+        ratios = frequencies / freq
+        cents = 1200 * np.log2(ratios)
+        closest_idx = np.argmin(np.abs(cents))
+        for i, note_freq in enumerate(frequencies):
+            for harmonic in [2, 3, 0.5]:
+                if abs(freq - note_freq*harmonic) < 10:
+                    return note_freq
+        return frequencies[closest_idx] if abs(cents[closest_idx]) < 50 else None
 
-    def handle_action(self, freq, confidence):
-        if confidence < self.config['audio_settings']['confidence_threshold']:
-            self.release_all()
+    def visualize_spectrum(self):
+        BANDS = 30
+        max_freq = 1000
+        max_bin = int(max_freq * self.chunk_size / self.sample_rate)
+        spectrum = np.log(self.spectrum[:max_bin] + 1e-10)
+        chunk_size = len(spectrum) // BANDS
+        if chunk_size == 0:
             return
+        bars = []
+        for i in range(BANDS):
+            band = spectrum[i*chunk_size:(i+1)*chunk_size]
+            bars.append(int(np.mean(band) * 2))
+        scale = "▁▂▃▄▅▆▇"
+        visualization = "".join([scale[min(v//2, len(scale)-1)] for v in bars])
+        print(f"\033[F\033[K{visualization}")
 
-        closest_freq = self.find_closest_note(freq)
-        if closest_freq is None:
-            return
+    def trigger_action(self, freq):
+        action = self.note_map[freq]
+        action_id = f"{action['type']}_{action['action']}"
+        if action_id not in self.active_actions:
+            if action['type'] == 'key':
+                self.keyboard.press(action['action'])
+            elif action['type'] == 'mouse':
+                btn = Button.left if action['action'] == 'left' else Button.right
+                self.mouse.press(btn)
+            self.active_actions.add(action_id)
 
-        note_config = self.note_map[closest_freq]
+    def release_actions(self):
+        for action_id in list(self.active_actions):
+            parts = action_id.split('_')
+            if parts[0] == 'key':
+                self.keyboard.release(parts[1])
+            elif parts[0] == 'mouse':
+                btn = Button.left if parts[1] == 'left' else Button.right
+                self.mouse.release(btn)
+            self.active_actions.remove(action_id)
 
-        current_time = time.time()
-        min_interval = 0.1 if self.cpu_profile == 'low' else 0.05
-
-        if current_time - self.last_processed_time < min_interval:
-            return
-
-        self.last_processed_time = current_time
-
-        if note_config['type'] == 'key':
-            self.handle_key(note_config['action'])
-        elif note_config['type'] == 'mouse':
-            self.handle_mouse(note_config['action'])
-
-    def handle_key(self, key):
-        if key not in self.key_states or not self.key_states.get(key, False):
-            self.keyboard.press(key)
-            self.key_states[key] = True
-
-    def handle_mouse(self, button):
-        if not self.mouse_states.get(button, False):
-            getattr(self.mouse, 'press')(getattr(mouse.Button, button))
-            self.mouse_states[button] = True
-
-    def release_all(self):
-        for key in list(self.key_states.keys()):
-            if self.key_states[key]:
-                self.keyboard.release(key)
-                self.key_states[key] = False
-
-        for button in ['left', 'right']:
-            if self.mouse_states.get(button, False):
-                getattr(self.mouse, 'release')(getattr(mouse.Button, button))
-                self.mouse_states[button] = False
-
-    def audio_callback(self, in_data, frame_count, time_info, status):
-        samples = np.frombuffer(in_data, dtype=np.float32)
-        pitch = self.pitch_detector(samples)[0]
-        conf = self.pitch_detector.get_confidence()
-
-        if self.cpu_profile == 'low':
-            pitch = round(pitch, 1)
-
-        self.handle_action(pitch, conf)
-        return (in_data, pyaudio.paContinue)
+    def display_note(self, freq):
+        note_info = self.note_display.get(freq, ("", "", ""))
+        visual = f"""
+        ╔══{'═'*len(note_info[2])}══╗
+        ║  {note_info[2]}  ║
+        ╚══{'═'*len(note_info[2])}══╝
+        {note_info[1]}
+        """
+        print(f"\033[F\033[K🎶 Нота: {note_info[0]} | Действие: {visual}")
 
     def run(self):
-        print("🎸 Controller started!")
-        self.optimize_cpu_usage()
-
+        print("\n🎮 Готов к игре! Нажмите Ctrl+C для выхода")
         try:
-            self.stream.start_stream()
-            while self.stream.is_active():
-                if self.cpu_profile == 'low':
-                    time.sleep(0.05)
-                elif self.cpu_profile == 'medium':
-                    time.sleep(0.03)
-                else:
+            with self.stream:
+                print("\n" * 5)
+                while True:
                     time.sleep(0.01)
         except KeyboardInterrupt:
-            print("\n🛑 Shutdown...")
-        finally:
-            self.release_all()
-            self.stream.stop_stream()
-            self.stream.close()
-            self.p.terminate()
+            print("\n🛑 Выключаю контроллер...")
+            self.release_actions()
 
 if __name__ == "__main__":
-    controller = OptimizedAudioController()
+    controller = GuitarHeroController()
     controller.run()
-

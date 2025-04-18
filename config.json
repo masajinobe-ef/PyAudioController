@@ -1,14 +1,9 @@
 {
   "audio_settings": {
-    "input_device": "default",
-    "chunk_size": 4096,
-    "sample_rate": 44100,
-    "silence_threshold": -50,
-    "confidence_threshold": 0.65,
-    "buffer_size": 2,
-    "pitch_algorithm": "yin",
-    "resample_quality": 3,
-    "cpu_usage": "low"
+    "sample_rate": 48000,
+    "chunk_size": 2048,
+    "silence_threshold": -35,
+    "detection_threshold": 1000
   },
   "note_bindings": {
     "E2": { "type": "key", "action": "w", "freq": 82.41 },
